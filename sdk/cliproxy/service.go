@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -15,7 +16,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor"
-	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
+	internalusage "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/watcher"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/wsrelay"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
@@ -480,6 +481,16 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	usage.StartDefault(ctx)
+	// 使用量统计持久化装载：
+	// 1) 根据配置文件路径推导出 data/usage-statistics.json；
+	// 2) 把 SnapshotFileStore 挂到全局 RequestStatistics 上，后续 Record 会异步落盘；
+	// 3) 仅在配置启用使用量统计时才把历史文件合并回内存，避免关闭时污染内存。
+	usageSnapshotPath := internalusage.SnapshotPath(s.configPath, filepath.Dir(s.configPath))
+	usageStats := internalusage.GetRequestStatistics()
+	usageStats.SetSnapshotStore(internalusage.NewSnapshotFileStore(usageSnapshotPath))
+	if err := internalusage.LoadSnapshotFromFileIfEnabled(s.cfg != nil && s.cfg.UsageStatisticsEnabled, usageSnapshotPath, usageStats); err != nil {
+		log.WithError(err).Warn("failed to load usage statistics snapshot")
+	}
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
@@ -786,6 +797,12 @@ func (s *Service) Shutdown(ctx context.Context) error {
 					shutdownErr = err
 				}
 			}
+		}
+
+		// 关闭前刷盘：确保最后一批统计数据写入 data/usage-statistics.json，
+		// 失败也只告警不阻塞关闭，避免磁盘故障拖住进程退出。
+		if err := internalusage.GetRequestStatistics().Flush(ctx); err != nil {
+			log.WithError(err).Warn("failed to flush usage statistics snapshot")
 		}
 
 		usage.StopDefault()
